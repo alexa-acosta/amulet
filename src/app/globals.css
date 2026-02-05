@@ -1,0 +1,30 @@
+@import "tailwindcss";
+
+@theme {
+  --color-wild-berry: #330511;
+  --color-cool-mist: #bdc5cf;
+  --color-ivory-cream: #f8f8ec;
+  --color-powder-grey: #dfe3ea;
+
+  --font-maitree: var(--font-maitree);
+  --font-briem-hand: var(--font-briem-hand);
+
+  --animate-marquee: marquee 90s linear infinite;
+
+  @keyframes marquee {
+    from {
+      transform: translateX(0);
+    }
+    to {
+      transform: translateX(-100%);
+    }
+  }
+}
+
+:root {
+  background-color: #330511;
+}
+
+body {
+  font-family: var(--font-maitree), serif;
+}
