@@ -9,7 +9,7 @@ export default function Home() {
         </div>
       </nav>
 
-      <div className="flex-1 bg-cool-mist rounded-t-[80px] rounded-b-none flex flex-col items-center justify-center shadow-2xl overflow-hidden relative">
+      <div className="flex-1 bg-powder-grey rounded-t-[80px] rounded-b-none flex flex-col items-center justify-center shadow-2xl overflow-hidden relative">
         <h1 className="text-[14rem] font-bold text-wild-berry leading-none tracking-tighter mb-4">
           amulet
         </h1>

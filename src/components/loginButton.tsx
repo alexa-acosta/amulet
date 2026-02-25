@@ -9,14 +9,14 @@ export default function LoginButton() {
     await supabase.auth.signInWithOAuth({
       provider: 'google',
       options: {
-        scopes: 'https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/userinfo.email',
-        // this tells google where to send the user after they log in
-        redirectTo: `${window.location.origin}/auth/callback?next=/home`,
+        scopes: 'https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/calendar.events.readonly https://www.googleapis.com/auth/userinfo.email',
         // asks for permanent access to google calendar
         queryParams: {
           access_type: 'offline',
           prompt: 'consent',
         },
+        // this tells google where to send the user after they log in
+        redirectTo: `${window.location.origin}/auth/callback?next=/home`,
       },
     })
   }

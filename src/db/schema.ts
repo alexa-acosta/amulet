@@ -6,8 +6,10 @@ export const users = pgTable("users", {
   //every user must have a unique email
   email: text("email").notNull().unique(),
   name: text("name"), 
+  anniversary: text("anniversary"),
   //automatically timestamp when the user was created
   createdAt: timestamp("created_at").defaultNow(), 
+  updatedAt: timestamp("updated_at").defaultNow(),
 });
 
 export const couples = pgTable("couples", {
