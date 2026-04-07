@@ -5,7 +5,6 @@ import { createClient } from '../../utils/supabase/client';
 import { format, startOfWeek, addDays, isSameDay, parseISO } from 'date-fns';
 import Link from 'next/link';
 
-// helpers
 const getContrastColor = (hexColor?: string) => {
   if (!hexColor) return 'text-black/80';
   const hex = hexColor.replace('#', '');
@@ -16,61 +15,161 @@ const getContrastColor = (hexColor?: string) => {
   return yiq >= 128 ? 'text-black/80' : 'text-white/95';
 };
 
-interface GoogleEvent {
-  id: string;
-  summary: string;
-  hexColor?: string;
-  start: { dateTime?: string; date?: string; };
-  end: { dateTime?: string; date?: string; };
-}
-
 export default function CalendarPage() {
   const supabase = createClient();
-  const [events, setEvents] = useState<GoogleEvent[]>([]);
+  const [sharedEvents, setSharedEvents] = useState<any[]>([]);
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
+  const [partnerId, setPartnerId] = useState<string | null>(null);
   const [view, setView] = useState<'mine' | 'theirs' | 'both'>('both');
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const fetchAllData = async () => {
+    const fetchAndSync = async () => {
       const { data: { session } } = await supabase.auth.getSession();
-      const token = session?.provider_token;
-      if (!token) return;
+      if (!session) return;
+      const uid = session.user.id;
+      const token = session.provider_token;
+      setCurrentUserId(uid);
 
       try {
-        const colorRes = await fetch('https://www.googleapis.com/calendar/v3/colors', {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-        const colorPalette = await colorRes.json();
-        const calRes = await fetch('https://www.googleapis.com/calendar/v3/users/me/calendarList', {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-        const calData = await calRes.json();
-        const allEvents: GoogleEvent[] = [];
+        // resolve couple + partner
+        const { data: profile } = await supabase
+          .from('users')
+          .select('id, couple_id')
+          .eq('id', uid)
+          .single();
 
-        await Promise.all(calData.items.map(async (cal: any) => {
-          const evRes = await fetch(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cal.id)}/events?singleEvents=true&timeMin=${startOfWeek(new Date()).toISOString()}`, {
+        if (!profile?.couple_id) return;
+
+        const { data: couple } = await supabase
+          .from('couples')
+          .select('partner_1_id, partner_2_id')
+          .eq('id', profile.couple_id)
+          .single();
+
+        let resolvedPartnerId: string | null = null;
+        if (couple) {
+          resolvedPartnerId = couple.partner_1_id === uid ? couple.partner_2_id : couple.partner_1_id;
+          setPartnerId(resolvedPartnerId);
+        }
+
+        if (token) {
+          // fetch fresh google events
+          const colorRes = await fetch('https://www.googleapis.com/calendar/v3/colors', {
             headers: { Authorization: `Bearer ${token}` }
           });
-          const evData = await evRes.json();
-          if (evData.items) {
-            allEvents.push(...evData.items.map((e: any) => ({
-              ...e,
-              hexColor: e.colorId && colorPalette.event?.[e.colorId] ? colorPalette.event[e.colorId].background : cal.backgroundColor
-            })));
+          const colorPalette = await colorRes.json();
+          const calRes = await fetch('https://www.googleapis.com/calendar/v3/users/me/calendarList', {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+          const calData = await calRes.json();
+
+          const googleEvents: any[] = [];
+          await Promise.all(calData.items.map(async (cal: any) => {
+            const evRes = await fetch(
+              `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cal.id)}/events?singleEvents=true&timeMin=${startOfWeek(new Date()).toISOString()}`,
+              { headers: { Authorization: `Bearer ${token}` } }
+            );
+            const evData = await evRes.json();
+            if (evData.items) {
+              googleEvents.push(...evData.items.map((e: any) => ({
+                google_event_id: e.id,
+                user_id: uid,
+                couple_id: profile.couple_id,
+                title: e.summary || '(no title)',
+                start_time: e.start.dateTime || e.start.date,
+                end_time: e.end.dateTime || e.end.date,
+                hex_color: e.colorId && colorPalette.event?.[e.colorId]
+                  ? colorPalette.event[e.colorId].background
+                  : cal.backgroundColor
+              })));
+            }
+          }));
+
+          // upsert user google events into database
+          if (googleEvents.length > 0) {
+            await supabase.from('events').upsert(googleEvents, { onConflict: 'google_event_id' });
           }
-        }));
-        setEvents(allEvents);
-      } catch (err) { console.error(err); }
+
+          // fetch user's current database rows
+          const { data: myDbEvents } = await supabase
+            .from('events')
+            .select('id, google_event_id, is_amulet_date, start_time, end_time')
+            .eq('user_id', uid);
+
+          const googleIdSet = new Set(googleEvents.map(e => e.google_event_id));
+
+          for (const dbEvent of (myDbEvents || [])) {
+            const baseId = dbEvent.google_event_id?.replace('_partner', '');
+            const stillExistsOnGoogle = googleIdSet.has(baseId) || googleIdSet.has(dbEvent.google_event_id);
+
+            if (!stillExistsOnGoogle) {
+              // event was deleted from google calendar
+              if (dbEvent.is_amulet_date) {
+                // cancel the google event entirely (removes it from partner's google calendar too)
+                // only cancel if user is the organizer (google_event_id doesn't have _partner suffix)
+                if (!dbEvent.google_event_id?.endsWith('_partner')) {
+                  await fetch(
+                    `https://www.googleapis.com/calendar/v3/calendars/primary/events/${baseId}?sendUpdates=all`,
+                    { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }
+                  );
+                }
+
+                // delete both database rows (mine + partner's _partner row)
+                await supabase
+                  .from('events')
+                  .delete()
+                  .or(`google_event_id.eq.${baseId},google_event_id.eq.${baseId}_partner`);
+              } else {
+                // regular event — just delete user's row
+                await supabase.from('events').delete().eq('id', dbEvent.id);
+              }
+            } else if (dbEvent.is_amulet_date && !dbEvent.google_event_id?.endsWith('_partner')) {
+              // amulet event still exists — sync any time changes to partner's _partner row
+              const updatedGoogle = googleEvents.find(e => e.google_event_id === dbEvent.google_event_id);
+              if (
+                updatedGoogle &&
+                (updatedGoogle.start_time !== dbEvent.start_time || updatedGoogle.end_time !== dbEvent.end_time)
+              ) {
+                await supabase
+                  .from('events')
+                  .update({
+                    start_time: updatedGoogle.start_time,
+                    end_time: updatedGoogle.end_time,
+                  })
+                  .eq('google_event_id', `${dbEvent.google_event_id}_partner`);
+              }
+            }
+          }
+        }
+
+        // fetch full couple schedule for UI
+        const { data: allCoupleEvents } = await supabase
+          .from('events')
+          .select('*')
+          .eq('couple_id', profile.couple_id);
+
+        setSharedEvents(allCoupleEvents || []);
+      } catch (err) {
+        console.error("Sync Error:", err);
+      } finally {
+        setLoading(false);
+      }
     };
-    fetchAllData();
+
+    fetchAndSync();
   }, [supabase]);
 
-  // toggle between showing only user's events, only others' events, or both
-  const displayEvents = view === 'theirs' ? [] : events;
   const days = [0, 1, 2, 3, 4, 5, 6].map(i => addDays(startOfWeek(new Date()), i));
+
+  if (loading) return (
+    <div className="min-h-screen bg-[#D0D7E1] flex items-center justify-center font-maitree text-wild-berry">
+      syncing calendars...
+    </div>
+  );
 
   return (
     <main className="min-h-screen bg-[#D0D7E1] flex flex-col pt-6 font-maitree overflow-hidden text-wild-berry lowercase">
-      {/* nav bar */}
       <nav className="flex justify-between items-center w-full px-12 py-4 text-3xl tracking-widest">
         <Link href="/home" className="opacity-50 hover:opacity-100">home</Link>
         <Link href="/browse" className="opacity-50 hover:opacity-100">browse</Link>
@@ -82,30 +181,22 @@ export default function CalendarPage() {
       </nav>
 
       <div className="flex-1 px-12 pb-12 mt-4 flex flex-col">
-        
-        {/* inline toggles & title */}
         <div className="flex justify-between items-end mb-6 px-4">
           <div className="flex gap-4">
             {(['mine', 'theirs', 'both'] as const).map((v) => (
               <button
                 key={v}
                 onClick={() => setView(v)}
-                className={`px-10 py-2 rounded-full text-xl transition-all duration-300 border ${
-                  view === v 
-                  ? 'bg-[#2D0A16] text-[#DFE4EA] border-[#2D0A16] shadow-lg' 
-                  : 'text-[#2D0A16] border-[#2D0A16]/30 hover:bg-[#2D0A16]/5' 
-                }`}
+                className={`px-10 py-2 rounded-full text-xl transition-all border ${view === v ? 'bg-[#2D0A16] text-[#DFE4EA] border-[#2D0A16] shadow-lg' : 'text-[#2D0A16] border-[#2D0A16]/30 hover:bg-[#2D0A16]/5'}`}
               >
                 {v}
               </button>
             ))}
           </div>
-          <h1 className="text-9xl font-regular tracking-tighter opacity-80 leading-[0.8] lowercase">calendar</h1>
+          <h1 className="text-9xl font-regular tracking-tighter opacity-80 leading-[0.8]">calendar</h1>
         </div>
-        
-        {/* main calendar card */}
+
         <div className="bg-white rounded-[60px] flex-1 flex flex-col overflow-hidden border border-wild-berry/10 shadow-2xl relative">
-          {/* calendar header (displays days) */}
           <div className="grid grid-cols-[100px_1fr_1fr_1fr_1fr_1fr_1fr_1fr] border-b border-gray-100 py-8 text-center bg-white z-20">
             <div className="text-[10px] text-gray-400 self-center uppercase tracking-[0.2em]">gmt-05</div>
             {days.map((day, i) => (
@@ -118,10 +209,8 @@ export default function CalendarPage() {
             ))}
           </div>
 
-          {/* scrollable grid */}
           <div className="flex-1 overflow-y-auto relative bg-white scrollbar-hide">
             <div className="grid grid-cols-[100px_1fr_1fr_1fr_1fr_1fr_1fr_1fr] min-h-[1200px] relative">
-              {/* time column */}
               <div className="flex flex-col border-r border-gray-100 bg-white z-10">
                 {Array.from({ length: 15 }, (_, i) => i + 7).map(h => (
                   <div key={h} className="h-20 text-right pr-6 text-[11px] text-gray-300 pt-1 border-b border-gray-50/50 uppercase">
@@ -130,90 +219,102 @@ export default function CalendarPage() {
                 ))}
               </div>
 
-              {/* event columns */}
               {days.map((day, dayIdx) => {
-                const dayEvents = displayEvents
-                  .filter(e => isSameDay(parseISO(e.start.dateTime || e.start.date || ""), day))
-                  .sort((a, b) => parseISO(a.start.dateTime || a.start.date || "").getTime() - parseISO(b.start.dateTime || b.start.date || "").getTime());
+                const dayEvents = sharedEvents.filter(e => isSameDay(parseISO(e.start_time), day));
+                let displayBlocks: any[] = [];
 
-                const positioned: any[] = [];
-                let clusters: any[][] = [];
+                if (view === 'both') {
+                  const amuletEvents = dayEvents.filter(e => e.is_amulet_date);
+                  const regularEvents = dayEvents.filter(e => !e.is_amulet_date);
 
-                // overlapping events ui
-                dayEvents.forEach(event => {
-                  const start = parseISO(event.start.dateTime || event.start.date || "").getTime();
-                  let addedToCluster = false;
-                  for (let cluster of clusters) {
-                    const clusterEnd = Math.max(...cluster.map(e => parseISO(e.end.dateTime || e.end.date || "").getTime()));
-                    if (start < clusterEnd) {
-                      cluster.push(event);
-                      addedToCluster = true;
-                      break;
+                  // deduplicate amulet events by base google_event_id so they only render once
+                  const seenAmuletIds = new Set<string>();
+                  const dedupedAmulet = amuletEvents.filter(e => {
+                    const baseId = e.google_event_id?.replace('_partner', '');
+                    if (seenAmuletIds.has(baseId)) return false;
+                    seenAmuletIds.add(baseId);
+                    return true;
+                  });
+
+                  // merge regular events into busy blocks
+                  if (regularEvents.length > 0) {
+                    const sorted = [...regularEvents].sort(
+                      (a, b) => parseISO(a.start_time).getTime() - parseISO(b.start_time).getTime()
+                    );
+                    let current = {
+                      start: parseISO(sorted[0].start_time),
+                      end: parseISO(sorted[0].end_time),
+                      title: 'busy',
+                      is_amulet_date: false,
+                    };
+                    for (let i = 1; i < sorted.length; i++) {
+                      const nextS = parseISO(sorted[i].start_time);
+                      const nextE = parseISO(sorted[i].end_time);
+                      if (nextS < current.end) {
+                        if (nextE > current.end) current.end = nextE;
+                      } else {
+                        displayBlocks.push({ ...current });
+                        current = { start: nextS, end: nextE, title: 'busy', is_amulet_date: false };
+                      }
                     }
+                    displayBlocks.push({ ...current });
                   }
-                  if (!addedToCluster) clusters.push([event]);
-                });
 
-                // position events within clusters, and determine how many columns each cluster needs
-                clusters.forEach(cluster => {
-                  const columns: any[][] = [];
-                  cluster.forEach(event => {
-                    const start = parseISO(event.start.dateTime || event.start.date || "").getTime();
-                    let colIdx = columns.findIndex(col => parseISO(col[col.length - 1].end.dateTime || col[col.length - 1].end.date || "").getTime() <= start);
-                    if (colIdx === -1) { colIdx = columns.length; columns.push([event]); }
-                    else { columns[colIdx].push(event); }
-                    
-                    const sH = parseISO(event.start.dateTime || event.start.date || "").getHours() + parseISO(event.start.dateTime || event.start.date || "").getMinutes() / 60;
-                    const eH = parseISO(event.end.dateTime || event.end.date || "").getHours() + parseISO(event.end.dateTime || event.end.date || "").getMinutes() / 60;
-
-                    positioned.push({
-                      ...event,
-                      colIdx,
-                      clusterCols: columns.length,
-                      top: (sH - 7) * 80,
-                      height: Math.max((eH - sH) * 80, 24)
+                  // amulet events render individually in blue
+                  dedupedAmulet.forEach(e => {
+                    displayBlocks.push({
+                      start: parseISO(e.start_time),
+                      end: parseISO(e.end_time),
+                      title: e.title,
+                      is_amulet_date: true,
                     });
                   });
 
-                  cluster.forEach(e => {
-                    const p = positioned.find(pe => pe.id === e.id);
-                    if (p) p.clusterCols = columns.length;
-                  });
-                });
+                } else {
+                  const targetId = view === 'mine' ? currentUserId : partnerId;
+                  const filtered = dayEvents.filter(e => e.user_id === targetId && !e.is_amulet_date);
+                  displayBlocks = filtered.map(e => ({
+                    start: parseISO(e.start_time),
+                    end: parseISO(e.end_time),
+                    title: e.title,
+                    is_amulet_date: false,
+                    hex_color: e.hex_color || '#2D0A16',
+                  }));
+                }
 
                 return (
                   <div key={dayIdx} className="border-r border-gray-50 relative h-full">
-                    {positioned.map((event: any) => {
-                      const hasCollision = positioned.some(other => 
-                        other.id !== event.id && 
-                        ((event.top >= other.top && event.top < (other.top + other.height)) ||
-                         (other.top >= event.top && other.top < (event.top + event.height)))
-                      );
+                    {displayBlocks.map((block, bIdx) => {
+                      const sH = block.start.getHours() + block.start.getMinutes() / 60;
+                      const eH = block.end.getHours() + block.end.getMinutes() / 60;
+                      const top = (sH - 7) * 80;
+                      const height = Math.max((eH - sH) * 80, 24);
 
-                      const isActuallySolo = !hasCollision;
-                      const colWidth = 100 / event.clusterCols;
+                      const bgColor = view === 'both'
+                        ? (block.is_amulet_date ? '#bdc5cf' : '#2D0A16')
+                        : (block.hex_color || '#2D0A16');
 
-                      const width = isActuallySolo ? `calc(100% - 8px)` : `${colWidth * 1.7}%`;
-                      const left = isActuallySolo ? `4px` : `${event.colIdx * colWidth}%`;
+                      const opacity = view === 'both'
+                        ? (block.is_amulet_date ? 0.9 : 0.8)
+                        : 1;
 
                       return (
-                        <div 
-                          key={event.id}
-                          style={{ 
-                            top: `${event.top}px`,
-                            height: `${event.height}px`,
-                            width: width,
-                            left: left,
-                            zIndex: 10 + event.colIdx,
-                            maxWidth: isActuallySolo ? '100%' : `${100 - (event.colIdx * colWidth)}%`,
-                            backgroundColor: event.hexColor
+                        <div
+                          key={bIdx}
+                          style={{
+                            top: `${top}px`,
+                            height: `${height}px`,
+                            backgroundColor: bgColor,
+                            opacity,
+                            width: 'calc(100% - 8px)',
+                            left: '4px',
                           }}
-                          className={`absolute rounded-xl p-3 text-[11px] leading-none transition-all shadow-md border border-white/20 ${getContrastColor(event.hexColor)}`}
+                          className={`absolute rounded-xl p-3 text-[11px] transition-all shadow-sm border border-white/20 z-10 ${view === 'both' ? 'text-white' : getContrastColor(block.hex_color)}`}
                         >
-                          <p className="font-bold tracking-tighter mb-1 truncate">{event.summary}</p>
-                          <p className="opacity-70 text-[10px] font-medium">
-                            {event.start.dateTime ? format(parseISO(event.start.dateTime), 'h:mm a') : 'all day'}
-                          </p>
+                          <p className="font-bold tracking-tighter truncate">{block.title}</p>
+                          {(view !== 'both' || block.is_amulet_date) && (
+                            <p className="opacity-70 text-[10px]">{format(block.start, 'h:mm a')}</p>
+                          )}
                         </div>
                       );
                     })}

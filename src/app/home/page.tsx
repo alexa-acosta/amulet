@@ -12,26 +12,40 @@ export default function HomePage() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const fetchAnniversary = async () => {
+    const fetchSharedAnniversary = async () => {
       try {
         const { data: { user } } = await supabase.auth.getUser();
         
         if (user) {
-          const { data } = await supabase
+          // get user profile to find the couple_id
+          const { data: profile } = await supabase
             .from('users')
-            .select('anniversary')
+            .select('couple_id')
             .eq('id', user.id)
             .single();
 
-          if (data?.anniversary) {
-            const today = new Date();
-            const originalDate = parseISO(data.anniversary);
-            let nextOccurrence = setYear(originalDate, getYear(today));
-            
-            if (isBefore(nextOccurrence, today)) {
-              nextOccurrence = setYear(originalDate, getYear(today) + 1);
+          if (profile?.couple_id) {
+            // fetch the anniversary from the shared couples table
+            const { data: coupleData } = await supabase
+              .from('couples')
+              .select('anniversary')
+              .eq('id', profile.couple_id)
+              .single();
+
+            if (coupleData?.anniversary) {
+              const today = new Date();
+              const originalDate = parseISO(coupleData.anniversary);
+              let nextOccurrence = setYear(originalDate, getYear(today));
+              
+              if (isBefore(nextOccurrence, today)) {
+                nextOccurrence = setYear(originalDate, getYear(today) + 1);
+              }
+              setTargetDate(nextOccurrence.toISOString());
             }
-            setTargetDate(nextOccurrence.toISOString());
+          } else {
+            // if they aren't linked yet, can optionally look at their personal profile 
+            // or just keep targetDate null to show the "set your anniversary" prompt
+            setTargetDate(null);
           }
         }
       } catch (err) {
@@ -41,7 +55,7 @@ export default function HomePage() {
       }
     };
 
-    fetchAnniversary();
+    fetchSharedAnniversary();
   }, [supabase]);
 
   const { days, hours, minutes, seconds } = useCountdown(targetDate || '');

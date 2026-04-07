@@ -58,13 +58,11 @@ export default function BrowsePage() {
   const [selectedCategory, setSelectedCategory] = useState<string>('entertainment');
   const [selectedIdea, setSelectedIdea] = useState<typeof DATE_IDEAS[0] | null>(null);
   
-  // New States for Planning
   const [isPlanning, setIsPlanning] = useState(false);
   const [plannedDate, setPlannedDate] = useState('');
   const [plannedTime, setPlannedTime] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  // Auto-scroll logic
   const scrollRef = useRef<HTMLDivElement>(null);
   const [isHovered, setIsHovered] = useState(false);
 
@@ -92,23 +90,49 @@ export default function BrowsePage() {
     setIsSubmitting(true);
 
     try {
-      // 1. Get the session for the Google provider_token
       const { data: { session } } = await supabase.auth.getSession();
       const token = session?.provider_token;
+      const user = session?.user;
 
-      if (!token) {
-        alert("You need to be logged in with Google to add to calendar!");
+      if (!token || !user) {
+        alert("You need to be logged in with Google!");
         setIsSubmitting(false);
         return;
       }
 
-      // 2. Format the date/time for Google (ISO format)
-      // Assuming a default 1-hour duration
+      // get couple info and partner email
+      const { data: profile } = await supabase
+        .from('users')
+        .select('couple_id')
+        .eq('id', user.id)
+        .single();
+
+      if (!profile?.couple_id) {
+        alert("no couple found!");
+        setIsSubmitting(false);
+        return;
+      }
+
+      const { data: couple } = await supabase
+        .from('couples')
+        .select('partner_1_id, partner_2_id')
+        .eq('id', profile.couple_id)
+        .single();
+
+      const partnerId = couple?.partner_1_id === user.id ? couple?.partner_2_id : couple?.partner_1_id;
+
+      // get partner's email to add as attendee
+      const { data: partnerUser } = await supabase
+        .from('users')
+        .select('email')
+        .eq('id', partnerId)
+        .single();
+
       const startDateTime = new Date(`${plannedDate}T${plannedTime}:00`).toISOString();
       const endDateTime = new Date(new Date(`${plannedDate}T${plannedTime}:00`).getTime() + 60 * 60 * 1000).toISOString();
 
-      // 3. Create the event in the Primary Google Calendar
-      const response = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+      // create in google calendar (adding partner as attendee)
+      const googleResponse = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events?sendUpdates=all', {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${token}`,
@@ -117,30 +141,44 @@ export default function BrowsePage() {
         body: JSON.stringify({
           summary: `amulet date: ${selectedIdea?.title}`,
           description: selectedIdea?.description,
-          start: {
-            dateTime: startDateTime,
-          },
-          end: {
-            dateTime: endDateTime,
-          },
+          start: { dateTime: startDateTime },
+          end: { dateTime: endDateTime },
+          attendees: [
+            { email: user.email },
+            { email: partnerUser?.email }
+          ],
         }),
       });
 
-      if (response.ok) {
-        alert(`✨ ${selectedIdea?.title} added! Check your calendar tab.`);
-        // Reset states
+      if (googleResponse.ok) {
+        const googleEvent = await googleResponse.json();
+
+        const amuletEvent = {
+          couple_id: profile.couple_id,
+          title: `amulet date: ${selectedIdea?.title}`,
+          start_time: startDateTime,
+          end_time: endDateTime,
+          is_amulet_date: true,
+          hex_color: '#bdc5cf'
+        };
+
+        // insert rows for both partners in amulet database
+        // use the same google_event_id for both so they stay synced
+        await supabase.from('events').insert([
+          { ...amuletEvent, user_id: user.id, google_event_id: googleEvent.id },
+          { ...amuletEvent, user_id: partnerId, google_event_id: `${googleEvent.id}_partner` },
+        ]);
+
+        alert(`${selectedIdea?.title} added to both calendars!`);
         setSelectedIdea(null);
         setIsPlanning(false);
-        setPlannedDate('');
-        setPlannedTime('');
       } else {
-        const error = await response.json();
-        console.error('Google API Error:', error);
-        alert("Failed to add to Google Calendar. Check console for details.");
+        const errorData = await googleResponse.json();
+        console.error('Google API Error:', errorData);
+        alert("Failed to sync with Google Calendar.");
       }
     } catch (err) {
       console.error('Error scheduling date:', err);
-      alert("Something went wrong while planning your date.");
     } finally {
       setIsSubmitting(false);
     }
@@ -172,7 +210,7 @@ export default function BrowsePage() {
           </span>
         </div>
 
-        {/* --- VIEW 1: CATEGORIES --- */}
+        {/* categories */}
         {view === 'categories' && (
           <div className="grid grid-cols-1 md:grid-cols-3 gap-12 mt-8 animate-in fade-in duration-700">
             {DATE_CATEGORIES.map((cat) => (
@@ -184,12 +222,12 @@ export default function BrowsePage() {
           </div>
         )}
 
-        {/* --- VIEW 2: CAROUSEL --- */}
+        {/* carousel */}
         {view === 'carousel' && (
           <div className="relative animate-in fade-in slide-in-from-right-8 duration-700">
             <div className="absolute -top-20 right-0 flex items-center gap-8">
-                <button onClick={() => setView('grid')} className="bg-wild-berry text-ivory-cream px-10 py-3 rounded-full text-sm tracking-widest hover:bg-wild-berry/90 transition-all active:scale-95">see all</button>
-                <button onClick={() => setView('categories')} className="text-wild-berry/40 hover:text-wild-berry tracking-widest transition-colors text-lg">back</button>
+              <button onClick={() => setView('grid')} className="bg-wild-berry text-ivory-cream px-10 py-3 rounded-full text-sm tracking-widest hover:bg-wild-berry/90 transition-all active:scale-95">see all</button>
+              <button onClick={() => setView('categories')} className="text-wild-berry/40 hover:text-wild-berry tracking-widest transition-colors text-lg">back</button>
             </div>
             
             <div 
@@ -209,10 +247,10 @@ export default function BrowsePage() {
           </div>
         )}
 
-        {/* --- VIEW 3: GRID VIEW --- */}
+        {/* grid view */}
         {view === 'grid' && (
           <div className="relative animate-in fade-in zoom-in-95 duration-500">
-             <button onClick={() => setView('carousel')} className="absolute -top-20 right-0 bg-wild-berry text-ivory-cream px-10 py-3 rounded-full text-sm tracking-widest hover:bg-wild-berry/90 transition-all active:scale-95">back</button>
+            <button onClick={() => setView('carousel')} className="absolute -top-20 right-0 bg-wild-berry text-ivory-cream px-10 py-3 rounded-full text-sm tracking-widest hover:bg-wild-berry/90 transition-all active:scale-95">back</button>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-8 mt-4">
               {DATE_IDEAS.map((idea) => (
                 <div key={idea.id} className="bg-powder-grey rounded-[40px] p-8 flex flex-col h-[400px] shadow-sm hover:shadow-lg transition-shadow items-center justify-center text-center">
@@ -225,7 +263,7 @@ export default function BrowsePage() {
         )}
       </div>
 
-      {/* --- DETAIL & PLANNING MODAL --- */}
+      {/* details + planning modal */}
       {selectedIdea && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-wild-berry/20 backdrop-blur-md animate-in fade-in duration-300" onClick={() => { if(!isSubmitting) setSelectedIdea(null); setIsPlanning(false); }}>
           <div className="bg-powder-grey w-full max-w-3xl rounded-[80px] p-20 relative shadow-2xl animate-in zoom-in-95 duration-500" onClick={(e) => e.stopPropagation()}>
@@ -251,8 +289,8 @@ export default function BrowsePage() {
                   <input type="date" className="bg-white/40 border-none rounded-3xl p-6 text-wild-berry text-xl outline-none focus:bg-white/60 transition-all" onChange={(e) => setPlannedDate(e.target.value)} disabled={isSubmitting} />
                   <input type="time" className="bg-white/40 border-none rounded-3xl p-6 text-wild-berry text-xl outline-none focus:bg-white/60 transition-all" onChange={(e) => setPlannedTime(e.target.value)} disabled={isSubmitting} />
                 </div>
-                <button 
-                  onClick={handleConfirmPlan} 
+                <button
+                  onClick={handleConfirmPlan}
                   disabled={isSubmitting}
                   className={`w-full bg-wild-berry text-ivory-cream py-6 rounded-full text-sm tracking-[0.5em] shadow-xl transition-all ${isSubmitting ? 'opacity-50 cursor-not-allowed' : 'hover:bg-wild-berry/90'}`}
                 >
